@@ -1,0 +1,3 @@
+[submodule "digikam"]
+	path = digikam
+	url = https://invent.kde.org/graphics/digikam.git
