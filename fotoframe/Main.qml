@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Dialogs
 
 Window {
     id: root
@@ -64,17 +65,30 @@ Window {
         clip: true
 
         // Empty-state overlay
-        Text {
+        Column {
             anchors.centerIn: parent
             visible: root.images.length === 0
-            text: photoLibrary.statusMessage !== ""
-                  ? photoLibrary.statusMessage
-                  : "Select one or more tags to start the river view."
-            color: "#888888"
-            font.pixelSize: 18
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode: Text.WordWrap
+            spacing: 20
             width: parent.width * 0.6
+
+            Text {
+                width: parent.width
+                text: photoLibrary.databaseAvailable
+                      ? "Select one or more tags to start the river view."
+                      : photoLibrary.statusMessage
+                color: "#888888"
+                font.pixelSize: 18
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+            }
+
+            // Shown when there is no digikam DB — primary call to action
+            Button {
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: !photoLibrary.databaseAvailable
+                text: "Select image folder…"
+                onClicked: folderDialog.open()
+            }
         }
 
         Repeater {
@@ -135,6 +149,21 @@ Window {
             anchors.verticalCenter: parent.verticalCenter
             anchors.leftMargin: 24
             spacing: 32
+
+            // ── Folder picker (fallback / override) ──────────────────────
+            Column {
+                spacing: 2
+                visible: !photoLibrary.databaseAvailable
+                Text {
+                    text: "Source folder"
+                    color: "white"
+                    font.pixelSize: 12
+                }
+                Button {
+                    text: "Select folder…"
+                    onClicked: folderDialog.open()
+                }
+            }
 
             // ── Tag selector ─────────────────────────────────────────────
             Column {
@@ -272,6 +301,13 @@ Window {
                 }
             }
         }
+    }
+
+    // ── Folder dialog ─────────────────────────────────────────────────────
+    FolderDialog {
+        id: folderDialog
+        title: "Select image folder"
+        onAccepted: photoLibrary.setFolder(selectedFolder.toString())
     }
 
     // ── Keyboard: F/F11 fullscreen, Escape quit ───────────────────────────

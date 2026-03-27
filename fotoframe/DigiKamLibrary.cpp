@@ -5,41 +5,51 @@
 #include <QSettings>
 #include <QStandardPaths>
 #include <QFile>
+#include <QDir>
+#include <QFileInfo>
 #include <QUrl>
+#include <QImageReader>
 #include <QDebug>
 #include <functional>
+#include <algorithm>
+
+// Recognised image extensions for folder mode.
+static const QStringList kImageFilters = {
+    "*.jpg", "*.jpeg", "*.png", "*.tif", "*.tiff", "*.webp", "*.bmp"
+};
 
 // ── Construction / destruction ─────────────────────────────────────────────
 
 DigiKamLibrary::DigiKamLibrary(QObject *parent)
     : QObject(parent)
 {
-    if (openDatabase())
-        loadTags();
+    if (openDatabase()) {
+        m_databaseAvailable = true;
+        emit databaseAvailableChanged();
+        loadDbTags();
+    }
 }
 
 DigiKamLibrary::~DigiKamLibrary()
 {
     const QString connName = m_db.connectionName();
     m_db.close();
-    m_db = QSqlDatabase(); // detach the handle before removeDatabase
-    QSqlDatabase::removeDatabase(connName);
+    m_db = QSqlDatabase();
+    if (!connName.isEmpty())
+        QSqlDatabase::removeDatabase(connName);
 }
 
-// ── Database init ──────────────────────────────────────────────────────────
+// ── DB mode: init ──────────────────────────────────────────────────────────
 
 bool DigiKamLibrary::openDatabase()
 {
-    // digikam stores its config in %APPDATA%\digikam\digikamrc on Windows.
-    // QStandardPaths::GenericConfigLocation → %APPDATA% on Windows.
     const QString configDir =
         QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
     const QString iniPath = configDir + "/digikam/digikamrc";
 
     if (!QFile::exists(iniPath)) {
-        m_statusMessage = QStringLiteral("digikamrc not found at %1").arg(iniPath);
+        m_statusMessage = QStringLiteral("No digikam database found. Select a folder to browse images.");
         emit statusMessageChanged();
-        qWarning() << m_statusMessage;
         return false;
     }
 
@@ -49,12 +59,12 @@ bool DigiKamLibrary::openDatabase()
     ini.endGroup();
 
     if (dbPath.isEmpty()) {
-        m_statusMessage = QStringLiteral("'Database Name' key not found in digikamrc");
+        m_statusMessage = QStringLiteral("'Database Name' not set in digikamrc");
         emit statusMessageChanged();
         return false;
     }
 
-    // KDE on Windows prefixes drive letters with a leading slash: "/C:/..." → "C:/..."
+    // KDE on Windows prefixes drive letters with '/': "/C:/..." → "C:/..."
     if (dbPath.startsWith('/') && dbPath.size() > 2 && dbPath.at(2) == ':')
         dbPath = dbPath.mid(1);
 
@@ -79,11 +89,11 @@ bool DigiKamLibrary::openDatabase()
     return true;
 }
 
-// ── Tag loading ────────────────────────────────────────────────────────────
+// ── DB mode: tag loading ───────────────────────────────────────────────────
 
-void DigiKamLibrary::loadTags()
+void DigiKamLibrary::loadDbTags()
 {
-    // Step 1: load all tags as (id → {pid, name})
+    // 1. Load all tags as id → {pid, name}
     QMap<int, QPair<int, QString>> raw;
     {
         QSqlQuery q(m_db);
@@ -92,7 +102,7 @@ void DigiKamLibrary::loadTags()
             raw[q.value(0).toInt()] = { q.value(1).toInt(), q.value(2).toString() };
     }
 
-    // Step 2: build full paths using memoised recursion so parent order doesn't matter
+    // 2. Build full paths with memoised recursion (handles any id ordering)
     QMap<int, QString> tagPaths;
     std::function<QString(int)> getPath = [&](int id) -> QString {
         if (tagPaths.contains(id))
@@ -106,7 +116,7 @@ void DigiKamLibrary::loadTags()
     for (auto it = raw.keyBegin(); it != raw.keyEnd(); ++it)
         getPath(*it);
 
-    // Step 3: collect IDs of tags that have at least one visible, in-scope image
+    // 3. Find tags that have at least one visible image
     QSet<int> activeIds;
     {
         QSqlQuery q(m_db);
@@ -120,7 +130,7 @@ void DigiKamLibrary::loadTags()
             activeIds.insert(q.value(0).toInt());
     }
 
-    // Step 4: build path → IDs map (only for active tags)
+    // 4. Build path → IDs map for active tags only
     m_tagNameToIds.clear();
     for (auto it = tagPaths.cbegin(); it != tagPaths.cend(); ++it) {
         if (activeIds.contains(it.key()))
@@ -136,43 +146,22 @@ void DigiKamLibrary::loadTags()
     emit allTagsChanged();
 }
 
-// ── Photo query ────────────────────────────────────────────────────────────
+// ── DB mode: photo query ───────────────────────────────────────────────────
 
-void DigiKamLibrary::setSelectedTags(const QStringList &tags)
+void DigiKamLibrary::refreshPhotosFromDb()
 {
-    if (m_selectedTags == tags)
+    if (m_selectedTags.isEmpty() || !m_db.isOpen())
         return;
-    m_selectedTags = tags;
-    emit selectedTagsChanged();
-    refreshPhotos();
-}
 
-void DigiKamLibrary::refreshPhotos()
-{
-    m_photos.clear();
-    m_aspectRatios.clear();
-    m_totalAspectSum = 0.0;
-
-    if (m_selectedTags.isEmpty() || !m_db.isOpen()) {
-        emit photosChanged();
-        return;
-    }
-
-    // Gather all tag IDs for the selected names
     QList<int> ids;
     for (const QString &name : std::as_const(m_selectedTags)) {
         const auto it = m_tagNameToIds.constFind(name);
         if (it != m_tagNameToIds.constEnd())
             ids.append(it.value());
     }
-    // ids may now contain sublists; flatten is already done by append(QList)
-
-    if (ids.isEmpty()) {
-        emit photosChanged();
+    if (ids.isEmpty())
         return;
-    }
 
-    // Build "?, ?, ?" placeholder string
     QStringList ph;
     ph.reserve(ids.size());
     for (int i = 0; i < ids.size(); ++i) ph << "?";
@@ -183,10 +172,10 @@ void DigiKamLibrary::refreshPhotos()
         "  ar.specificPath, al.relativePath, i.name, "
         "  ii.creationDate, ii.width, ii.height, ii.orientation "
         "FROM Images i "
-        "JOIN Albums         al ON al.id      = i.album "
-        "JOIN AlbumRoots     ar ON ar.id      = al.albumRoot "
-        "JOIN ImageInformation ii ON ii.imageid = i.id "
-        "JOIN ImageTags      it ON it.imageid  = i.id "
+        "JOIN Albums           al ON al.id       = i.album "
+        "JOIN AlbumRoots       ar ON ar.id       = al.albumRoot "
+        "JOIN ImageInformation ii ON ii.imageid  = i.id "
+        "JOIN ImageTags        it ON it.imageid  = i.id "
         "WHERE it.tagid IN (%1) "
         "  AND i.status = 1 AND i.category = 1 "
         "ORDER BY ii.creationDate ASC, i.name ASC"
@@ -197,7 +186,6 @@ void DigiKamLibrary::refreshPhotos()
 
     if (!q.exec()) {
         qWarning() << "Photo query failed:" << q.lastError().text();
-        emit photosChanged();
         return;
     }
 
@@ -212,8 +200,123 @@ void DigiKamLibrary::refreshPhotos()
         m_aspectRatios  << ar;
         m_totalAspectSum += ar;
     }
+}
+
+// ── Folder mode: load ──────────────────────────────────────────────────────
+
+void DigiKamLibrary::setFolder(const QString &folderUrl)
+{
+    // QML FolderDialog gives us a file:// URL; convert to a local path.
+    QString localPath = QUrl(folderUrl).toLocalFile();
+    if (localPath.isEmpty())
+        localPath = folderUrl; // already a plain path
+
+    if (!QDir(localPath).exists()) {
+        qWarning() << "setFolder: path does not exist:" << localPath;
+        return;
+    }
+
+    loadFromFolder(localPath);
+}
+
+void DigiKamLibrary::loadFromFolder(const QString &localPath)
+{
+    m_folderTagFiles.clear();
+    m_usingFolderMode = true;
+
+    const QDir rootDir(localPath);
+
+    // Root-level images → tag = the selected folder's own name
+    const QString rootTag = rootDir.dirName();
+    const QStringList rootFiles =
+        rootDir.entryList(kImageFilters, QDir::Files, QDir::Name);
+    for (const QString &f : rootFiles)
+        m_folderTagFiles[rootTag] << rootDir.absoluteFilePath(f);
+
+    // First-level subfolders → tag = subfolder name
+    const QStringList subDirs =
+        rootDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString &sub : subDirs) {
+        QDir subDir(rootDir.absoluteFilePath(sub));
+        const QStringList files =
+            subDir.entryList(kImageFilters, QDir::Files, QDir::Name);
+        for (const QString &f : files)
+            m_folderTagFiles[sub] << subDir.absoluteFilePath(f);
+    }
+
+    // Drop tags with no images
+    for (auto it = m_folderTagFiles.begin(); it != m_folderTagFiles.end(); ) {
+        it->isEmpty() ? it = m_folderTagFiles.erase(it) : ++it;
+    }
+
+    // Reset selection
+    m_selectedTags.clear();
+    emit selectedTagsChanged();
+
+    // Rebuild allTags
+    m_allTags = m_folderTagFiles.keys();
+    std::sort(m_allTags.begin(), m_allTags.end(),
+              [](const QString &a, const QString &b) {
+                  return a.compare(b, Qt::CaseInsensitive) < 0;
+              });
+    emit allTagsChanged();
+
+    refreshPhotos();
+}
+
+// ── Folder mode: photo query ───────────────────────────────────────────────
+
+void DigiKamLibrary::refreshPhotosFromFolder()
+{
+    if (m_selectedTags.isEmpty())
+        return;
+
+    // Collect and sort paths from all selected tags
+    QStringList allPaths;
+    for (const QString &tag : std::as_const(m_selectedTags)) {
+        const auto it = m_folderTagFiles.constFind(tag);
+        if (it != m_folderTagFiles.constEnd())
+            allPaths.append(it.value());
+    }
+
+    // Sort by filename (date is often encoded there: YYYYMMDD_HHMMSS, etc.)
+    std::sort(allPaths.begin(), allPaths.end(), [](const QString &a, const QString &b) {
+        return QFileInfo(a).fileName().compare(QFileInfo(b).fileName(),
+                                               Qt::CaseInsensitive) < 0;
+    });
+    allPaths.removeDuplicates();
+
+    for (const QString &path : std::as_const(allPaths)) {
+        const qreal ar = aspectFromFile(path);
+        m_photos        << QUrl::fromLocalFile(path).toString();
+        m_aspectRatios  << ar;
+        m_totalAspectSum += ar;
+    }
+}
+
+// ── Shared dispatch ────────────────────────────────────────────────────────
+
+void DigiKamLibrary::refreshPhotos()
+{
+    m_photos.clear();
+    m_aspectRatios.clear();
+    m_totalAspectSum = 0.0;
+
+    if (!m_usingFolderMode)
+        refreshPhotosFromDb();
+    else
+        refreshPhotosFromFolder();
 
     emit photosChanged();
+}
+
+void DigiKamLibrary::setSelectedTags(const QStringList &tags)
+{
+    if (m_selectedTags == tags)
+        return;
+    m_selectedTags = tags;
+    emit selectedTagsChanged();
+    refreshPhotos();
 }
 
 // ── Static helpers ─────────────────────────────────────────────────────────
@@ -223,7 +326,6 @@ QString DigiKamLibrary::buildFilePath(const QString &specificPath,
                                       const QString &imageName)
 {
     QString path = specificPath + relativePath + "/" + imageName;
-    // KDE on Windows stores "/C:/..." — strip the leading slash before the drive letter
     if (path.startsWith('/') && path.size() > 2 && path.at(2) == ':')
         path = path.mid(1);
     return QUrl::fromLocalFile(path).toString();
@@ -232,10 +334,19 @@ QString DigiKamLibrary::buildFilePath(const QString &specificPath,
 qreal DigiKamLibrary::effectiveAspect(int dbWidth, int dbHeight, int orientation)
 {
     if (dbWidth <= 0 || dbHeight <= 0)
-        return 1.5; // 3:2 fallback
-
-    // EXIF orientations 5–8 are 90°/270° rotations: display width ↔ height
+        return 1.5;
+    // EXIF orientations 5–8 = 90°/270° rotation → swap axes
     if (orientation >= 5)
         return static_cast<qreal>(dbHeight) / dbWidth;
     return static_cast<qreal>(dbWidth) / dbHeight;
+}
+
+qreal DigiKamLibrary::aspectFromFile(const QString &localPath)
+{
+    QImageReader reader(localPath);
+    reader.setAutoTransform(true);      // accounts for EXIF rotation
+    const QSize size = reader.size();   // header-only read, no full decode
+    if (size.width() > 0 && size.height() > 0)
+        return static_cast<qreal>(size.width()) / size.height();
+    return 1.5;
 }

@@ -4,7 +4,7 @@ project(fotoframe VERSION 0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Quick Sql)
+find_package(Qt6 REQUIRED COMPONENTS Quick Sql QuickDialogs2)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -32,7 +32,7 @@ set_target_properties(appfotoframe PROPERTIES
 )
 
 target_link_libraries(appfotoframe
-    PRIVATE Qt6::Quick Qt6::Sql
+    PRIVATE Qt6::Quick Qt6::Sql Qt6::QuickDialogs2
 )
 
 include(GNUInstallDirs)
