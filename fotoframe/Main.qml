@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 
 Window {
     id: root
@@ -8,128 +9,275 @@ Window {
     title: qsTr("FotoFrame")
     color: "black"
 
-    // ---------------------------------------------------------------
-    // Test images – set these four paths to images on your machine.
-    // Use forward slashes on Windows: "file:///C:/Users/You/pic.jpg"
-    // ---------------------------------------------------------------
-    readonly property var images: [
-        "file:///C:/Users/MiCHi/Documents/Slideshow-Test/_PTB19_CUBE_20388.jpg",
-        "file:///C:/Users/MiCHi/Documents/Slideshow-Test/_PTB19_CUBE_20398.jpg",
-        "file:///C:/Users/MiCHi/Documents/Slideshow-Test/PTB19_FISH_023713.jpg",
-        "file:///C:/Users/MiCHi/Documents/Slideshow-Test/_PTB19_BIRD_14613.jpg"
-    ]
+    // ── Photo data from C++ ───────────────────────────────────────────────
+    // photoLibrary is a DigiKamLibrary instance set as a context property.
+    //   photoLibrary.allTags       — QStringList, all tags with images (sorted)
+    //   photoLibrary.selectedTags  — QStringList, read/write
+    //   photoLibrary.photos        — QStringList, file:// URLs sorted by date
+    //   photoLibrary.aspectRatios  — QList<qreal>, parallel to photos
+    //   photoLibrary.totalAspectSum — qreal, sum of all aspect ratios
+    //   photoLibrary.statusMessage — QString, error text or ""
 
-    // ---------------------------------------------------------------
-    // Timing (milliseconds)
-    // ---------------------------------------------------------------
-    readonly property int displayMs:    6000   // time each image is shown
-    readonly property int transitionMs: 1200   // slide duration
-    readonly property int panMs:        displayMs + transitionMs  // Ken Burns span
+    readonly property var    images:       photoLibrary.photos
+    readonly property var    aspectRatios: photoLibrary.aspectRatios
 
-    // ---------------------------------------------------------------
-    // Ken Burns presets: [fromX, fromY, fromScale, toX, toY, toScale]
-    //
-    // x/y are pixel offsets applied to the image item (which is the
-    // same size as the slot) with transformOrigin at its center.
-    // The image is scaled from that center, so valid pan range is:
-    //   |offsetX| ≤ (scale − 1) × slotWidth  / 2
-    //   |offsetY| ≤ (scale − 1) × slotHeight / 2
-    // For a 1280×720 slot:
-    //   scale 1.25 → ±160 px wide, ±90 px tall
-    //   scale 1.30 → ±192 px wide, ±108 px tall
-    // ---------------------------------------------------------------
-    readonly property var kbPresets: [
-        [   0,    0,  1.00,  120,   60,  1.30 ],   // zoom in,  drift right+down
-        [  80,  -50,  1.25,  -80,   50,  1.25 ],   // pan left+down, constant zoom
-        [   0,    0,  1.10,  -80,  -40,  1.30 ],   // zoom in,  drift left+up
-        [ -80,   50,  1.25,   80,  -50,  1.25 ],   // pan right+up, constant zoom
-    ]
+    // ── River view settings ───────────────────────────────────────────────
+    property real speed:   150   // px/sec
+    property int  numRows: 4     // 1–10
 
-    // ---------------------------------------------------------------
-    // Slide direction vectors: where the current image exits.
-    //   (-1,  0) → exits left,  next enters from right
-    //   ( 0, -1) → exits up,    next enters from below
-    //   ( 1,  0) → exits right, next enters from left
-    //   ( 0,  1) → exits down,  next enters from above
-    // ---------------------------------------------------------------
-    readonly property var dirs: [
-        Qt.point(-1,  0),
-        Qt.point( 0, -1),
-        Qt.point( 1,  0),
-        Qt.point( 0,  1),
-    ]
+    // ── Derived geometry ──────────────────────────────────────────────────
+    readonly property real slotHeight: height / numRows
+    // loopWidth = total display width of all photos end-to-end at slotHeight
+    readonly property real loopWidth:  slotHeight * photoLibrary.totalAspectSum
+    readonly property real staggerPx:  slotHeight * 2.5
+    // Extra items to keep the right edge covered after per-row stagger offset
+    readonly property int  extraItems: 20
+    readonly property int  stripItems: Math.max(images.length, 1) + extraItems
 
-    // ---------------------------------------------------------------
-    // Mutable state
-    // ---------------------------------------------------------------
-    property int  currentIdx:    0
-    property int  dirIdx:        0
-    property bool aIsFront:      true
-    property bool transitioning: false
+    // ── Scroll state ──────────────────────────────────────────────────────
+    property real scrollOffset: 0
 
-    // ---------------------------------------------------------------
-    // Apply a Ken Burns preset to an image and start its animations.
-    // Sets the image to the start position immediately, then runs the
-    // drift over panMs so the motion is already underway when the
-    // slot slides into view.
-    // ---------------------------------------------------------------
-    function applyKenBurns(img, animX, animY, animS, presetIdx) {
-        var p     = kbPresets[presetIdx % kbPresets.length]
-        img.x     = p[0]
-        img.y     = p[1]
-        img.scale = p[2]
-        animX.from = p[0]; animX.to = p[3]; animX.start()
-        animY.from = p[1]; animY.to = p[4]; animY.start()
-        animS.from = p[2]; animS.to = p[5]; animS.start()
+    // ── Frame loop ────────────────────────────────────────────────────────
+    FrameAnimation {
+        id: frameLoop
+        running: root.images.length > 0 && root.loopWidth > 0
+        property int frameCount: 0
+        onTriggered: {
+            root.scrollOffset = (root.scrollOffset + root.speed * frameTime) % root.loopWidth
+            frameCount++
+        }
     }
 
-    // ---------------------------------------------------------------
-    // Slide to the next image.
-    // ---------------------------------------------------------------
-    function doTransition() {
-        if (transitioning) return
-        transitioning = true
-
-        var ni  = (currentIdx + 1) % images.length
-        var dir = dirs[dirIdx % dirs.length]
-        dirIdx++
-
-        var outSlot = aIsFront ? slotA : slotB
-        var inSlot  = aIsFront ? slotB : slotA
-        var inImg   = aIsFront ? imgB  : imgA
-        var inAnimX = aIsFront ? kbBx  : kbAx
-        var inAnimY = aIsFront ? kbBy  : kbAy
-        var inAnimS = aIsFront ? kbBs  : kbAs
-
-        // Place incoming slot off-screen on the entry side, then load.
-        inSlot.x = -dir.x * root.width
-        inSlot.y = -dir.y * root.height
-        inSlot.z = 1
-        outSlot.z = 0
-        inImg.source = images[ni]
-        applyKenBurns(inImg, inAnimX, inAnimY, inAnimS, ni)
-
-        // Outgoing slot exits in dir; incoming slot arrives at (0,0).
-        outXAnim.target = outSlot; outXAnim.from = outSlot.x; outXAnim.to =  dir.x * root.width
-        outYAnim.target = outSlot; outYAnim.from = outSlot.y; outYAnim.to =  dir.y * root.height
-        inXAnim.target  = inSlot;  inXAnim.from  = inSlot.x;  inXAnim.to  = 0
-        inYAnim.target  = inSlot;  inYAnim.from  = inSlot.y;  inYAnim.to  = 0
-        slideAnim.start()
-
-        currentIdx = ni
-        aIsFront   = !aIsFront
+    Timer {
+        interval: 1000
+        repeat: true
+        running: true
+        onTriggered: {
+            fpsLabel.text = "FPS: " + frameLoop.frameCount
+            frameLoop.frameCount = 0
+        }
     }
 
-    // ---------------------------------------------------------------
-    // Scene: two full-screen clipped slots (A on top initially).
-    // clip:true on each slot keeps the scaled/panned image from
-    // bleeding into the adjacent slot during a transition.
-    // ---------------------------------------------------------------
+    // ── River rows ────────────────────────────────────────────────────────
     Item {
-        id: scene
+        anchors.fill: parent
+        clip: true
+
+        // Empty-state overlay
+        Text {
+            anchors.centerIn: parent
+            visible: root.images.length === 0
+            text: photoLibrary.statusMessage !== ""
+                  ? photoLibrary.statusMessage
+                  : "Select one or more tags to start the river view."
+            color: "#888888"
+            font.pixelSize: 18
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            width: parent.width * 0.6
+        }
+
+        Repeater {
+            model: root.numRows
+
+            delegate: Item {
+                required property int index
+
+                y: index * root.slotHeight
+                width: root.width
+                height: root.slotHeight
+                clip: true
+
+                Row {
+                    height: parent.height
+                    x: -(root.scrollOffset + index * root.staggerPx)
+
+                    Repeater {
+                        model: root.stripItems
+
+                        Image {
+                            required property int index
+
+                            readonly property int imgIdx:
+                                root.images.length > 0 ? index % root.images.length : 0
+
+                            height: root.slotHeight
+                            width:  root.images.length > 0
+                                    ? root.slotHeight * root.aspectRatios[imgIdx]
+                                    : root.slotHeight
+
+                            source: root.images.length > 0 ? root.images[imgIdx] : ""
+
+                            // Full image, no cropping.
+                            // Width is already set to the correct aspect-ratio value,
+                            // so PreserveAspectFit == exact fit with no bars.
+                            fillMode: Image.PreserveAspectFit
+                            smooth: true
+                            asynchronous: true
+                            cache: true
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Controls overlay ─────────────────────────────────────────────────
+    Rectangle {
+        id: controlBar
+        anchors.bottom: parent.bottom
+        width: parent.width
+        height: 80
+        color: Qt.rgba(0, 0, 0, 0.65)
+
+        Row {
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: 24
+            spacing: 32
+
+            // ── Tag selector ─────────────────────────────────────────────
+            Column {
+                spacing: 2
+                Text {
+                    text: photoLibrary.selectedTags.length === 0
+                          ? "Tags: none"
+                          : "Tags: " + photoLibrary.selectedTags.length + " selected"
+                    color: "white"
+                    font.pixelSize: 12
+                }
+                Button {
+                    text: "Choose tags \u25be"
+                    onClicked: tagPopup.visible ? tagPopup.close() : tagPopup.open()
+                }
+            }
+
+            // ── Speed ─────────────────────────────────────────────────────
+            Column {
+                spacing: 2
+                Text {
+                    text: "Speed: " + root.speed.toFixed(0) + " px/s"
+                    color: "white"
+                    font.pixelSize: 12
+                }
+                Slider {
+                    width: 200
+                    from: 30; to: 800
+                    value: root.speed
+                    onMoved: root.speed = value
+                }
+            }
+
+            // ── Row count ─────────────────────────────────────────────────
+            Column {
+                spacing: 2
+                Text {
+                    text: "Rows: " + root.numRows
+                    color: "white"
+                    font.pixelSize: 12
+                }
+                Slider {
+                    width: 150
+                    from: 1; to: 10; stepSize: 1
+                    value: root.numRows
+                    onMoved: root.numRows = Math.round(value)
+                }
+            }
+        }
+
+        // FPS indicator
+        Text {
+            id: fpsLabel
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.rightMargin: 24
+            text: "FPS: --"
+            color: "#00ff66"
+            font.pixelSize: 18
+            font.bold: true
+            font.family: "Courier New"
+        }
+    }
+
+    // ── Tag picker popup ─────────────────────────────────────────────────
+    Popup {
+        id: tagPopup
+        // Position just above the control bar
+        x: 24
+        y: root.height - controlBar.height - implicitHeight - 8
+        width: 320
+        height: Math.min(480, root.height - controlBar.height - 32)
+        padding: 0
+        modal: false
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
+
+        background: Rectangle {
+            color: Qt.rgba(0.1, 0.1, 0.1, 0.95)
+            border.color: "#444"
+            radius: 4
+        }
+
+        // Search field + list
+        Column {
+            anchors.fill: parent
+            anchors.margins: 8
+            spacing: 6
+
+            TextField {
+                id: tagSearch
+                width: parent.width
+                placeholderText: "Filter tags…"
+                color: "white"
+                background: Rectangle { color: "#222"; radius: 3 }
+            }
+
+            ListView {
+                id: tagList
+                width: parent.width
+                height: tagPopup.height - tagSearch.height - 22
+                clip: true
+
+                model: photoLibrary.allTags.filter(
+                    function(t) {
+                        return tagSearch.text.length === 0
+                            || t.toLowerCase().indexOf(tagSearch.text.toLowerCase()) >= 0
+                    }
+                )
+
+                ScrollBar.vertical: ScrollBar {}
+
+                delegate: CheckDelegate {
+                    required property string modelData
+                    width: tagList.width
+                    text: modelData
+                    checked: photoLibrary.selectedTags.indexOf(modelData) >= 0
+                    contentItem: Text {
+                        leftPadding: 8
+                        text: parent.text
+                        color: "white"
+                        font.pixelSize: 13
+                        elide: Text.ElideRight
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    background: Rectangle {
+                        color: parent.hovered ? "#333" : "transparent"
+                    }
+                    onToggled: {
+                        var sel = photoLibrary.selectedTags.slice()
+                        var idx = sel.indexOf(modelData)
+                        if (idx >= 0) sel.splice(idx, 1)
+                        else sel.push(modelData)
+                        photoLibrary.selectedTags = sel
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Keyboard: F/F11 fullscreen, Escape quit ───────────────────────────
+    Item {
         anchors.fill: parent
         focus: true
-
         Keys.onPressed: (event) => {
             if (event.key === Qt.Key_F || event.key === Qt.Key_F11) {
                 root.visibility = (root.visibility === Window.FullScreen)
@@ -140,95 +288,5 @@ Window {
                 event.accepted = true
             }
         }
-
-        // Slot B – starts off-screen to the right
-        Item {
-            id: slotB
-            width: root.width; height: root.height
-            x: root.width
-            clip: true
-
-            Image {
-                id: imgB
-                x: 0; y: 0
-                width: parent.width; height: parent.height
-                fillMode:        Image.PreserveAspectCrop
-                smooth:          true
-                asynchronous:    true
-                transformOrigin: Item.Center
-            }
-        }
-
-        // Slot A – visible at start
-        Item {
-            id: slotA
-            width: root.width; height: root.height
-            x: 0
-            clip: true
-
-            Image {
-                id: imgA
-                x: 0; y: 0
-                width: parent.width; height: parent.height
-                fillMode:        Image.PreserveAspectCrop
-                smooth:          true
-                asynchronous:    true
-                transformOrigin: Item.Center
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // Ken Burns animations – linear drift, one set per slot.
-    // Duration spans display + transition so the pan continues
-    // smoothly while the slot is sliding in or out.
-    // ---------------------------------------------------------------
-    NumberAnimation { id: kbAx; target: imgA; property: "x";     duration: root.panMs; easing.type: Easing.Linear }
-    NumberAnimation { id: kbAy; target: imgA; property: "y";     duration: root.panMs; easing.type: Easing.Linear }
-    NumberAnimation { id: kbAs; target: imgA; property: "scale"; duration: root.panMs; easing.type: Easing.Linear }
-    NumberAnimation { id: kbBx; target: imgB; property: "x";     duration: root.panMs; easing.type: Easing.Linear }
-    NumberAnimation { id: kbBy; target: imgB; property: "y";     duration: root.panMs; easing.type: Easing.Linear }
-    NumberAnimation { id: kbBs; target: imgB; property: "scale"; duration: root.panMs; easing.type: Easing.Linear }
-
-    // ---------------------------------------------------------------
-    // Slide transition – four NumberAnimations in parallel with
-    // dynamically assigned targets (set before each start() call).
-    // ---------------------------------------------------------------
-    ParallelAnimation {
-        id: slideAnim
-        NumberAnimation { id: outXAnim; property: "x"; duration: root.transitionMs; easing.type: Easing.InOutCubic }
-        NumberAnimation { id: outYAnim; property: "y"; duration: root.transitionMs; easing.type: Easing.InOutCubic }
-        NumberAnimation { id: inXAnim;  property: "x"; duration: root.transitionMs; easing.type: Easing.InOutCubic }
-        NumberAnimation { id: inYAnim;  property: "y"; duration: root.transitionMs; easing.type: Easing.InOutCubic }
-        onStopped: {
-            root.transitioning = false
-            // The decoder now has the full displayMs window to finish.
-            // Preload the image after next into the idle (off-screen) slot.
-            var preloadIdx = (root.currentIdx + 1) % root.images.length
-            var idleImg    = root.aIsFront ? imgB : imgA
-            idleImg.source = root.images[preloadIdx]
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // Auto-advance timer
-    // ---------------------------------------------------------------
-    Timer {
-        interval: root.displayMs
-        repeat:   true
-        running:  true
-        onTriggered: root.doTransition()
-    }
-
-    // ---------------------------------------------------------------
-    // Bootstrap
-    // ---------------------------------------------------------------
-    Component.onCompleted: {
-        scene.forceActiveFocus()
-        imgA.source = images[0]
-        applyKenBurns(imgA, kbAx, kbAy, kbAs, 0)
-        // Preload image[1] immediately so the decoder has the full
-        // first display window (6 s) before the first transition.
-        imgB.source = images[1 % images.length]
     }
 }
